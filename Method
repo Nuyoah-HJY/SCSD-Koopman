@@ -1,0 +1,393 @@
+from __future__ import annotations
+
+from pathlib import Path
+import sys
+from typing import Dict, Optional
+import numpy as np
+import pandas as pd
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if not (PROJECT_ROOT / "gt_fcm_common.py").is_file():
+    raise ImportError("look")
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from gt_fcm_common import (
+    PreprocessConfig,
+    FuzzyRegime as _OriginalFuzzyRegime,
+    _band_feature_name,
+    _fdi_smc_order_keep_mask as _scsd_order_keep_mask,
+    _numeric_array,
+    _normalize_rows,
+    _is_new_sequence_window,
+)
+from global_speed_edmd import GlobalSpeedEDMD as _OriginalGlobalSpeedEDMD
+
+__all__ = ["_scsd_features", "FuzzyRegime", "GlobalSpeedEDMD"]
+
+
+def _scsd_features(
+    pressure: np.ndarray,
+    cfg: PreprocessConfig,
+    *,
+    hp_speed_rpm: Optional[float] = None,
+    lp_speed_rpm: Optional[float] = None,
+) -> Dict[str, float]:
+
+
+    values = np.asarray(pressure, dtype=float)
+    output_names = {
+        (lo, hi): f"p123_{_band_feature_name(lo, hi)}_scsd_db"
+        for lo, hi in cfg.spectral_bands_hz
+    }
+    if values.ndim != 2 or values.shape[1] != 3 or len(values) < 16:
+        return {name: 0.0 for name in output_names.values()}
+
+    values = values - np.nanmean(values, axis=0, keepdims=True)
+    segment_samples = min(4096, len(values))
+    hop = max(segment_samples // 2, 1)
+    starts = np.arange(0, len(values) - segment_samples + 1, hop, dtype=int)
+    if starts.size == 0:
+        starts = np.asarray([0], dtype=int)
+    window = np.hanning(segment_samples)
+    window_power = max(float(np.sum(window * window)), float(cfg.eps))
+    segments = np.stack([values[start : start + segment_samples] for start in starts])
+    spectrum = np.fft.rfft(segments * window[None, :, None], axis=1)
+    frequencies = np.fft.rfftfreq(segment_samples, d=1.0 / float(cfg.sample_rate_hz))
+    max_frequency = max(float(hi) for _, hi in cfg.spectral_bands_hz)
+    needed = frequencies < max_frequency
+    spectrum = spectrum[:, needed, :]
+    frequencies = frequencies[needed]
+
+    csm = np.einsum("kfc,kfd->fcd", spectrum, np.conjugate(spectrum), optimize=True)
+    csm /= float(len(starts)) * window_power
+    if len(csm) > 1:
+        csm[1:] *= 2.0
+    csm[0] = 0.0
+    eigenvalues = np.maximum(np.linalg.eigvalsh(csm).real, 0.0)
+    residual = eigenvalues[:, 0] + eigenvalues[:, 1]
+    dominant = eigenvalues[:, 2]
+    total = dominant + residual
+    floor = max(float(cfg.eps), 1e-30)
+    contrast_db = 10.0 * np.log10((dominant + floor) / (residual + floor))
+
+    candidate_variants = {
+        str(value).strip().lower()
+        for value in getattr(cfg, "fdi_smc_candidate_variants", ())
+        if str(value).strip()
+    }
+    allowed_candidate_variants = {"enhanced", "order_masked_enhanced"}
+    unknown_candidate_variants = candidate_variants - allowed_candidate_variants
+    if unknown_candidate_variants:
+        raise ValueError(
+            "Unknown SCSD candidate variants: "
+            f"{sorted(unknown_candidate_variants)}"
+        )
+    order_keep = _scsd_order_keep_mask(
+        frequencies,
+        hp_speed_rpm=hp_speed_rpm,
+        lp_speed_rpm=lp_speed_rpm,
+        max_order=int(getattr(cfg, "fdi_smc_order_mask_max_order", 12)),
+        half_width_bins=float(
+            getattr(cfg, "fdi_smc_order_mask_half_width_bins", 1.0)
+        ),
+    )
+
+
+    candidate_fractions = tuple(
+        float(value)
+        for value in getattr(cfg, "fdi_smc_candidate_fractions", ())
+    )
+    for fraction in candidate_fractions:
+        if not 0.0 < fraction <= 1.0:
+            raise ValueError(
+                "SCSD candidate aggregation fractions must be in (0, 1]."
+            )
+
+    out: Dict[str, float] = {}
+    for lo, hi in cfg.spectral_bands_hz:
+        mask = (frequencies >= float(lo)) & (frequencies < float(hi))
+        name = output_names[(lo, hi)]
+        if not np.any(mask):
+            out[name] = 0.0
+            continue
+        local_total = total[mask]
+        local_contrast = contrast_db[mask]
+        energetic = local_total >= np.quantile(local_total, 0.50)
+        eligible = local_contrast[energetic]
+        if eligible.size == 0:
+            eligible = local_contrast
+        fractions = (0.20, *candidate_fractions)
+        values_by_fraction: Dict[float, float] = {}
+        for fraction in dict.fromkeys(fractions):
+            top_count = max(3, int(np.ceil(float(fraction) * eligible.size)))
+            top_count = min(top_count, eligible.size)
+            values_by_fraction[float(fraction)] = float(
+                np.mean(np.partition(eligible, -top_count)[-top_count:])
+            )
+
+        out[name] = values_by_fraction[0.20]
+
+        if candidate_variants:
+            band_reference = max(float(np.median(local_total)), floor)
+            local_dominant = dominant[mask]
+            prominence_db = 10.0 * np.log10(
+                (local_dominant + floor) / (band_reference + floor)
+            )
+            prominence_weight = float(
+                getattr(cfg, "fdi_smc_enhanced_prominence_weight", 1.0)
+            )
+            if not 0.0 <= prominence_weight <= 1.0:
+                raise ValueError(
+                    "SCSD enhanced prominence weight must be in [0, 1]."
+                )
+            enhanced = local_contrast + prominence_weight * prominence_db
+            enhanced_eligible = enhanced[energetic]
+            if enhanced_eligible.size == 0:
+                enhanced_eligible = enhanced
+            enhanced_count = max(
+                3,
+                int(np.ceil(0.20 * enhanced_eligible.size)),
+            )
+            enhanced_count = min(enhanced_count, enhanced_eligible.size)
+            enhanced_value = float(
+                np.mean(
+                    np.partition(enhanced_eligible, -enhanced_count)[
+                        -enhanced_count:
+                    ]
+                )
+            )
+            if "enhanced" in candidate_variants:
+                out[name.replace("_scsd_db", "_enhanced_scsd_db")] = enhanced_value
+
+            if "order_masked_enhanced" in candidate_variants:
+                local_order_keep = order_keep[mask]
+                masked_eligible = enhanced[energetic & local_order_keep]
+
+
+                if masked_eligible.size >= 3:
+                    masked_count = max(
+                        3,
+                        int(np.ceil(0.20 * masked_eligible.size)),
+                    )
+                    masked_count = min(masked_count, masked_eligible.size)
+                    masked_value = float(
+                        np.mean(
+                            np.partition(masked_eligible, -masked_count)[
+                                -masked_count:
+                            ]
+                        )
+                    )
+                    retained_fraction = float(
+                        masked_eligible.size / max(int(np.sum(energetic)), 1)
+                    )
+                else:
+                    masked_value = enhanced_value
+                    retained_fraction = 1.0
+                out[
+                    name.replace(
+                        "_scsd_db",
+                        "_enhanced_scsd_order_masked_db",
+                    )
+                ] = masked_value
+                out[
+                    name.replace(
+                        "_scsd_db",
+                        "_enhanced_scsd_order_retained_fraction",
+                    )
+                ] = retained_fraction
+        for fraction in candidate_fractions:
+            percent = 100.0 * float(fraction)
+            percent_tag = f"{percent:g}".replace(".", "p")
+            candidate_name = name.replace(
+                "_scsd_db",
+                f"_scsd_top{percent_tag}pct_db",
+            )
+            out[candidate_name] = values_by_fraction[float(fraction)]
+    return out
+
+
+class FuzzyRegime(_OriginalFuzzyRegime):
+
+    def memberships(
+        self,
+        speed_state: pd.DataFrame | np.ndarray,
+        *,
+        apply_hysteresis: bool = True,
+    ) -> np.ndarray:
+        if isinstance(speed_state, pd.DataFrame):
+            n = speed_state["n_mean"].to_numpy(dtype=float)
+            dn = speed_state["dn_dt"].to_numpy(dtype=float)
+            d3 = _numeric_array(speed_state, "hp_delta3", 0.0)
+            d20 = _numeric_array(speed_state, "hp_delta20", 0.0)
+            run_max_gap = _numeric_array(speed_state, "hp_run_max_gap", 0.0)
+        else:
+            arr = np.asarray(speed_state, dtype=float)
+            if arr.ndim == 1:
+                arr = arr.reshape(1, -1)
+            n = arr[:, 0]
+            dn = arr[:, 1] if arr.shape[1] >= 2 else np.zeros(len(arr), dtype=float)
+            d3 = np.zeros(len(arr), dtype=float)
+            d20 = np.zeros(len(arr), dtype=float)
+            run_max_gap = np.zeros(len(arr), dtype=float)
+
+        speed_mu = []
+        widths = self.__dict__.get("speed_widths")
+        if widths is None:
+            legacy_width = float(self.__dict__.get("speed_width", 1.0))
+            widths = (legacy_width, legacy_width, legacy_width)
+        for center, width in zip(self.speed_centers, widths):
+            mu = np.exp(-0.5 * ((n - center) / max(width, 1e-6)) ** 2)
+            speed_mu.append(mu)
+        speed_mu = np.vstack(speed_mu).T
+        row_sums = np.sum(speed_mu, axis=1)
+        underflow = row_sums <= 1e-12
+        if np.any(underflow):
+            centers = np.asarray(self.speed_centers, dtype=float)
+            nearest = np.argmin(np.abs(n[underflow, None] - centers[None, :]), axis=1)
+            speed_mu[underflow, :] = 0.0
+            speed_mu[np.flatnonzero(underflow), nearest] = 1.0
+        speed_mu = _normalize_rows(speed_mu)
+
+        phase_scales = self.__dict__.get("phase_scales")
+        phase_weights = self.__dict__.get("phase_weights")
+        if phase_scales is None or phase_weights is None:
+            phase = dn
+        else:
+            phase = (
+                phase_weights[0] * dn / max(phase_scales[0], 1e-6)
+                + phase_weights[1] * d3 / max(phase_scales[1], 1e-6)
+                + phase_weights[2] * d20 / max(phase_scales[2], 1e-6)
+            )
+        th = max(self.trend_threshold, 1e-6)
+        phase = np.clip(phase, -3.0 * th, 3.0 * th)
+        steady = np.exp(-0.5 * (phase / th) ** 2)
+        rising = np.exp(-0.5 * ((phase - th) / th) ** 2)
+        falling = np.exp(-0.5 * ((phase + th) / th) ** 2)
+
+
+        low_gate = np.clip(speed_mu[:, 0], 0.0, 1.0)
+        high_gate = np.clip(speed_mu[:, 2], 0.0, 1.0)
+        history_scale = max(float(self.speed_centers[2] - self.speed_centers[0]), 1.0)
+        has_reached_running_speed = 1.0 / (
+            1.0 + np.exp(-((-run_max_gap / history_scale) - 0.30) / 0.08)
+        )
+        startup = rising * (0.15 + 0.85 * low_gate)
+        startup += 0.35 * steady * low_gate * (1.0 - has_reached_running_speed)
+        accel = rising * (0.20 + 0.80 * (1.0 - low_gate))
+        high_steady = steady * (0.10 + 0.90 * high_gate)
+        decel = falling * (0.20 + 0.80 * (1.0 - low_gate))
+        shutdown = falling * (0.15 + 0.85 * low_gate)
+        shutdown += 0.35 * steady * low_gate * has_reached_running_speed
+        stage_mu = _normalize_rows(
+            np.vstack([startup, accel, high_steady, decel, shutdown]).T
+        )
+
+        regimes = []
+        for i in range(3):
+            for j in range(5):
+                regimes.append(speed_mu[:, i] * stage_mu[:, j])
+        mu = _normalize_rows(np.vstack(regimes).T)
+        if (
+            apply_hysteresis
+            and isinstance(speed_state, pd.DataFrame)
+            and float(getattr(self, "hysteresis", 0.0)) > 0.0
+            and len(mu) > 1
+        ):
+            smoothed = mu.copy()
+            for idx in range(1, len(smoothed)):
+                if _is_new_sequence_window(speed_state, idx):
+                    continue
+                smoothed[idx] = (
+                    (1.0 - float(getattr(self, "hysteresis", 0.0))) * mu[idx]
+                    + float(getattr(self, "hysteresis", 0.0)) * smoothed[idx - 1]
+                )
+            mu = _normalize_rows(smoothed)
+        return mu
+
+
+class GlobalSpeedEDMD(_OriginalGlobalSpeedEDMD):
+
+
+    def _dictionary(self, frame):
+        base = self.input_scaler.transform(frame[self.state_cols].to_numpy(float))
+
+
+        gates = self.regime.memberships(frame, apply_hysteresis=False)
+        selected = base[:, [self.state_cols.index(c) for c in self.PRODUCT_COLUMNS]]
+        products = (gates[:, :, None] * selected[:, None, :]).reshape(len(base), -1)
+        return np.column_stack((base, gates, products))
+
+
+    def fit(self, train_df):
+        from gt_fcm_common import _fit_multioutput_weighted_ridge
+        frame = self.prepare_frame(train_df, fit_relation=True)
+        self.input_scaler.fit(frame[self.state_cols].to_numpy(float))
+        self.regime = FuzzyRegime.fit(frame, self.cfg)
+        self.dictionary_cols = [*self.state_cols,
+            *[f'gate_{name}' for name in self.regime.names],
+            *[f'gate_{name}_times_{col}' for name in self.regime.names
+              for col in self.PRODUCT_COLUMNS]]
+        raw = self._dictionary(frame)
+        self.state_scaler.fit(raw)
+        z = self.state_scaler.transform(raw)
+        current, following = self._transition_indices(frame)
+        self.time_step_seconds_ = self._check_time_step(frame)
+        if len(current) < 16:
+            raise ValueError('EDMD needs at least 16 true within-run transition pairs.')
+        self.transition_count_ = len(current)
+        self.global_operator_, self.global_bias_ = _fit_multioutput_weighted_ridge(
+            z[current], z[following], np.ones(len(current)),
+            float(self.cfg.koopman_transition_ridge_alpha))
+
+        self.spectral_radius_ = float(np.max(np.abs(np.linalg.eigvals(self.global_operator_))))
+        predicted = self._transition_prediction(z[current])
+        self.training_one_step_rmse_ = float(np.sqrt(np.mean((predicted-z[following])**2)))
+        self.persistence_one_step_rmse_ = float(np.sqrt(np.mean((z[current]-z[following])**2)))
+        boundaries = np.ones(len(z), dtype=bool)
+        boundaries[following] = False
+        for horizon in (1, 5, 20, 60):
+            eligible = [i for i in range(len(z)-horizon)
+                        if not np.any(boundaries[i+1:i+horizon+1])]
+            if not eligible:
+                continue
+            positions = np.unique(np.linspace(0, len(eligible)-1, min(32,len(eligible))).astype(int))
+            starts = np.asarray(eligible)[positions]
+            predicted = z[starts].copy()
+            for _ in range(horizon):
+                predicted = self._transition_prediction(predicted)
+            self.multistep_state_rmse_[horizon] = float(np.sqrt(np.mean((predicted-z[starts+horizon])**2)))
+            self.multistep_persistence_rmse_[horizon] = float(np.sqrt(np.mean((z[starts]-z[starts+horizon])**2)))
+        return self
+
+
+    def rollout_components(self, prepared_df, observer_gain, fault_gating=False):
+        from gt_fcm_common import _is_new_sequence_window, HP_LP_GATE_MIN_HP_RPM
+        gain = float(observer_gain)
+        self._check_time_step(prepared_df)
+        if not 0. < gain < 1.:
+            raise ValueError('The deployed EDMD observer requires 0 < gain < 1; gain=1 bypasses K.')
+        observed = self.observed_states(prepared_df)
+        predicted, filtered = observed.copy(), observed.copy()
+        gating_active = np.zeros(len(observed), dtype=bool)
+        if fault_gating:
+            lp_valid = pd.to_numeric(prepared_df['lp_valid'], errors='coerce').fillna(0.).to_numpy(float)
+            hp_speed = pd.to_numeric(prepared_df['n_mean'], errors='coerce').fillna(0.).to_numpy(float)
+
+
+            gating_active = (lp_valid < 0.5) & (hp_speed > float(HP_LP_GATE_MIN_HP_RPM))
+            lp_mask = self.lp_group_mask()
+        for i in range(1,len(observed)):
+            if _is_new_sequence_window(prepared_df,i):
+                continue
+            predicted[i] = self._transition_prediction(filtered[i-1])
+            updated = (1.-gain)*predicted[i] + gain*observed[i]
+            if fault_gating and gating_active[i]:
+                updated = np.where(lp_mask, filtered[i-1], updated)
+            filtered[i] = updated
+        if not np.isfinite(filtered).all():
+            raise ValueError('EDMD observer diverged; inspect the trained operator.')
+        return dict(observed=observed, predicted=predicted, filtered=filtered,
+                    memberships=self.regime.memberships(prepared_df,apply_hysteresis=False),
+                    fault_gating_active=gating_active,
+                    fault_gated_rows=int(gating_active.sum()))
